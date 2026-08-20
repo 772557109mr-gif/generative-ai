@@ -21,7 +21,8 @@ package dto
 type SyncAddRequest struct {
 	// DryRun overrides the config-level dry_run setting when present.
 	// A nil pointer means "use the config value".
-	DryRun *bool `json:"dry_run,omitempty"`
+	DryRun    *bool `json:"dry_run,omitempty"`
+	DirectLaw *bool `json:"direct_law,omitempty"`
 }
 
 // Validate checks that SyncAddRequest contains only valid field values.
@@ -37,12 +38,15 @@ type SyncAddResponse struct {
 	LicensesSoftFailed int    `json:"licenses_soft_failed"`
 	GroupsProcessed    int    `json:"groups_processed"`
 	DryRun             bool   `json:"dry_run"`
+	DirectLaw          bool   `json:"direct_law"`
 }
 
 // SyncRemoveRequest is the HTTP request body for POST /sync/remove.
 type SyncRemoveRequest struct {
 	// DryRun overrides the config-level dry_run setting when present.
-	DryRun *bool `json:"dry_run,omitempty"`
+	DryRun          *bool `json:"dry_run,omitempty"`
+	DirectLaw       *bool `json:"direct_law,omitempty"`
+	GCSkipGroupEval *bool `json:"gc_skip_group_eval,omitempty"`
 }
 
 // Validate checks that SyncRemoveRequest contains only valid field values.
@@ -56,4 +60,6 @@ type SyncRemoveResponse struct {
 	LicensesRevoked int    `json:"licenses_revoked"`
 	UsersEvaluated  int    `json:"users_evaluated"`
 	DryRun          bool   `json:"dry_run"`
+	DirectLaw       bool   `json:"direct_law"`
+	GCSkipGroupEval bool   `json:"gc_skip_group_eval"`
 }

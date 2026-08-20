@@ -18,15 +18,16 @@ package services
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
 
-	"github.com/cloud-gtm/gemini-box-office/internal/config"
-	"github.com/cloud-gtm/gemini-box-office/internal/middleware"
-	"github.com/cloud-gtm/gemini-box-office/internal/models"
-	"github.com/cloud-gtm/gemini-box-office/internal/models/dto"
-	"github.com/cloud-gtm/gemini-box-office/internal/ports"
+	"github.com/GoogleCloudPlatform/generative-ai/search/gemini-enterprise/group-licensing/internal/config"
+	"github.com/GoogleCloudPlatform/generative-ai/search/gemini-enterprise/group-licensing/internal/middleware"
+	"github.com/GoogleCloudPlatform/generative-ai/search/gemini-enterprise/group-licensing/internal/models"
+	"github.com/GoogleCloudPlatform/generative-ai/search/gemini-enterprise/group-licensing/internal/models/dto"
+	"github.com/GoogleCloudPlatform/generative-ai/search/gemini-enterprise/group-licensing/internal/ports"
 )
 
 // GCService implements the "garbage_collection" workflow: for every configured
@@ -61,18 +62,28 @@ func (s *GCService) Run(ctx context.Context, cfg *config.EntitlementConfig, req 
 	if req.DryRun != nil {
 		dryRun = *req.DryRun
 	}
+	directLaw := false
+	if req.DirectLaw != nil {
+		directLaw = *req.DirectLaw
+	}
+	gcSkipGroupEval := false
+	if req.GCSkipGroupEval != nil {
+		gcSkipGroupEval = *req.GCSkipGroupEval
+	}
 
 	start := time.Now()
 	logger.InfoContext(ctx, "garbage collection workflow starting",
 		slog.Int("project_count", len(cfg.Projects)),
 		slog.Int("staleness_threshold_days", cfg.Settings.StalenessThresholdDays),
 		slog.Bool("dry_run", dryRun),
+		slog.Bool("direct_law_mode", directLaw),
+		slog.Bool("gc_skip_group_eval", gcSkipGroupEval),
 	)
 
 	var totalRevoked, totalEvaluated int
 
 	for projectID, projectCfg := range cfg.Projects {
-		revoked, evaluated, err := s.processProject(ctx, projectID, projectCfg, cfg.Settings.StalenessThresholdDays, dryRun)
+		revoked, evaluated, err := s.processProject(ctx, projectID, projectCfg, cfg.Settings.StalenessThresholdDays, dryRun, gcSkipGroupEval)
 		if err != nil {
 			logger.ErrorContext(ctx, "garbage collection workflow failed",
 				slog.String("project_id", projectID),
@@ -84,6 +95,16 @@ func (s *GCService) Run(ctx context.Context, cfg *config.EntitlementConfig, req 
 		}
 		totalRevoked += revoked
 		totalEvaluated += evaluated
+
+		// verbose debug logging: Emitted per-project
+		logger.DebugContext(ctx, "project processed",
+			slog.String("project_id", projectID),
+			slog.Int("licenses_revoked", revoked),
+			slog.Int("users_evaluated", evaluated),
+			slog.Bool("dry_run", dryRun),
+			slog.Bool("direct_law_mode", directLaw),
+			slog.Bool("gc_skip_group_eval", gcSkipGroupEval),
+		)
 	}
 
 	elapsed := time.Since(start).Milliseconds()
@@ -92,12 +113,16 @@ func (s *GCService) Run(ctx context.Context, cfg *config.EntitlementConfig, req 
 		slog.Int("licenses_revoked", totalRevoked),
 		slog.Int("users_evaluated", totalEvaluated),
 		slog.Bool("dry_run", dryRun),
+		slog.Bool("direct_law_mode", directLaw),
+		slog.Bool("gc_skip_group_eval", gcSkipGroupEval),
 	)
 
 	return dto.SyncRemoveResponse{
 		LicensesRevoked: totalRevoked,
 		UsersEvaluated:  totalEvaluated,
 		DryRun:          dryRun,
+		DirectLaw:       directLaw,
+		GCSkipGroupEval: gcSkipGroupEval,
 	}, nil
 }
 
@@ -105,71 +130,89 @@ func (s *GCService) Run(ctx context.Context, cfg *config.EntitlementConfig, req 
 // revokes licences from users who are stale or no longer entitled. It returns
 // the number of licenses revoked and users evaluated.
 //
-// Revocation candidates are chunked and flushed per page so that memory usage
-// is bounded to one page of candidates at any point rather than accumulating
-// the full result set before issuing any writes.
-func (s *GCService) processProject(ctx context.Context, projectID string, projectCfg config.ProjectConfig, thresholdDays int, dryRun bool) (licensesRevoked, usersEvaluated int, err error) {
-	var pageToken string
-	var pageCount int
-
-	for {
-		if err := ctx.Err(); err != nil {
-			return 0, 0, fmt.Errorf("context cancelled: %w", err)
+// Each distinct location in projectCfg gets its own pagination loop so that
+// ListUserLicenses and BatchUpdateUserLicenses are always called with the
+// correct location. Revocation candidates are chunked and flushed per page so
+// that memory usage is bounded to one page of candidates at any point rather
+// than accumulating the full result set before issuing any writes.
+func (s *GCService) processProject(ctx context.Context, projectID string, projectCfg config.ProjectConfig, thresholdDays int, dryRun bool, gcSkipGroupEval bool) (licensesRevoked, usersEvaluated int, err error) {
+	seen := make(map[models.Location]bool)
+	var locations []models.Location
+	for _, entry := range projectCfg {
+		if !seen[entry.Location] {
+			seen[entry.Location] = true
+			locations = append(locations, entry.Location)
 		}
-		if pageCount >= models.MaxPagesPerGroup {
-			middleware.LoggerFromContext(ctx).WarnContext(ctx,
-				"license listing exceeded page limit, truncating",
-				slog.String("project_id", projectID),
-				slog.Int("max_pages", models.MaxPagesPerGroup),
-			)
-			break
-		}
-		pageCount++
-		licenses, next, err := s.gemini.ListUserLicenses(ctx, projectID, pageToken)
-		if err != nil {
-			return 0, 0, fmt.Errorf("project %q listing licenses: %w", projectID, err)
-		}
+	}
 
-		var pageRevocations []models.LicenseUpdate
+	for _, location := range locations {
+		var pageToken string
+		var pageCount int
 
-		for _, license := range licenses {
+		for {
 			if err := ctx.Err(); err != nil {
 				return 0, 0, fmt.Errorf("context cancelled: %w", err)
 			}
-			if license.State == models.LicenseStateRevoked {
-				continue
+			if pageCount >= models.MaxPagesPerGroup {
+				middleware.LoggerFromContext(ctx).WarnContext(ctx,
+					"license listing exceeded page limit, truncating",
+					slog.String("project_id", projectID),
+					slog.Int("max_pages", models.MaxPagesPerGroup),
+				)
+				break
 			}
-			usersEvaluated++
-
-			shouldRevoke, err := s.shouldRevoke(ctx, license, projectCfg, thresholdDays)
+			pageCount++
+			licenses, next, err := s.gemini.ListUserLicenses(ctx, projectID, location, pageToken)
 			if err != nil {
-				return 0, 0, fmt.Errorf("project %q evaluating license: %w", projectID, err)
+				return 0, 0, fmt.Errorf("project %q listing licenses: %w", projectID, err)
 			}
 
-			if shouldRevoke {
-				pageRevocations = append(pageRevocations, models.LicenseUpdate{
-					UserEmail:         license.UserEmail,
-					LicenseConfigPath: license.LicenseConfigPath,
-					Action:            models.LicenseActionRevoke,
-				})
-			}
-		}
+			var pageRevocations []models.LicenseUpdate
 
-		if len(pageRevocations) > 0 {
-			if !dryRun {
-				for _, chunk := range chunkLicenseUpdates(pageRevocations, models.MaxBatchSize) {
-					if err := s.gemini.BatchUpdateUserLicenses(ctx, projectID, chunk); err != nil {
-						return 0, 0, fmt.Errorf("project %q batch revoke: %w", projectID, err)
-					}
+			for _, license := range licenses {
+				if err := ctx.Err(); err != nil {
+					return 0, 0, fmt.Errorf("context cancelled: %w", err)
+				}
+				if license.State == models.LicenseStateRevoked {
+					continue
+				}
+				usersEvaluated++
+
+				shouldRevoke, err := s.shouldRevoke(ctx, license, projectCfg, thresholdDays, gcSkipGroupEval)
+				if err != nil {
+					return 0, 0, fmt.Errorf("project %q evaluating license: %w", projectID, err)
+				}
+
+				if shouldRevoke {
+					pageRevocations = append(pageRevocations, models.LicenseUpdate{
+						UserEmail:         license.UserEmail,
+						LicenseConfigPath: license.LicenseConfigPath,
+						Action:            models.LicenseActionRevoke,
+					})
 				}
 			}
-			licensesRevoked += len(pageRevocations)
-		}
 
-		if next == "" {
-			break
+			if len(pageRevocations) > 0 {
+				if !dryRun {
+					for _, chunk := range chunkLicenseUpdates(pageRevocations, models.MaxBatchSize) {
+						if err := s.gemini.BatchUpdateUserLicenses(ctx, projectID, location, chunk); err != nil {
+							return 0, 0, fmt.Errorf("project %q batch revoke: %w", projectID, err)
+						}
+						// verbose debug logging: Emitted per batch
+						middleware.LoggerFromContext(ctx).DebugContext(ctx, "batch revoked",
+							slog.String("project_id", projectID),
+							slog.Int("count", len(chunk)),
+						)
+					}
+				}
+				licensesRevoked += len(pageRevocations)
+			}
+
+			if next == "" {
+				break
+			}
+			pageToken = next
 		}
-		pageToken = next
 	}
 
 	return licensesRevoked, usersEvaluated, nil
@@ -188,7 +231,7 @@ func (s *GCService) processProject(ctx context.Context, projectID string, projec
 //     before the user has had a chance to sign in.
 //   - When both are zero (pathological; should not occur in practice), the user
 //     is treated as immediately stale and the license is revoked.
-func (s *GCService) shouldRevoke(ctx context.Context, license models.UserLicense, projectCfg config.ProjectConfig, thresholdDays int) (bool, error) {
+func (s *GCService) shouldRevoke(ctx context.Context, license models.UserLicense, projectCfg config.ProjectConfig, thresholdDays int, gcSkipGroupEval bool) (bool, error) {
 	// Staleness check: only performed when thresholdDays > 0.
 	if thresholdDays > 0 {
 		ref := license.LastLoginTime
@@ -202,12 +245,25 @@ func (s *GCService) shouldRevoke(ctx context.Context, license models.UserLicense
 		}
 	}
 
+	// If the skip entitlement check flag is enabled, bypass the group checks.
+	if gcSkipGroupEval {
+		return false, nil
+	}
+
 	// Entitlement check: the user must be a member of at least one group
 	// across all entries in the project config.
 	for _, entry := range projectCfg {
 		for _, groupEmail := range entry.Groups {
 			isMember, err := s.idp.HasMember(ctx, groupEmail, license.UserEmail)
 			if err != nil {
+				if errors.Is(err, models.ErrInvalidMemberKey) {
+					middleware.LoggerFromContext(ctx).WarnContext(ctx,
+						"skipping licensed user with invalid member key",
+						slog.String("problematic_username", license.UserEmail),
+						slog.String("group_email", groupEmail),
+					)
+					return false, nil
+				}
 				return false, fmt.Errorf("checking membership: %w", err)
 			}
 			if isMember {

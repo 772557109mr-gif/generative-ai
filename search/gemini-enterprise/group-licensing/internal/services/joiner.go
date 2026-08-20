@@ -23,11 +23,11 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/cloud-gtm/gemini-box-office/internal/config"
-	"github.com/cloud-gtm/gemini-box-office/internal/middleware"
-	"github.com/cloud-gtm/gemini-box-office/internal/models"
-	"github.com/cloud-gtm/gemini-box-office/internal/models/dto"
-	"github.com/cloud-gtm/gemini-box-office/internal/ports"
+	"github.com/GoogleCloudPlatform/generative-ai/search/gemini-enterprise/group-licensing/internal/config"
+	"github.com/GoogleCloudPlatform/generative-ai/search/gemini-enterprise/group-licensing/internal/middleware"
+	"github.com/GoogleCloudPlatform/generative-ai/search/gemini-enterprise/group-licensing/internal/models"
+	"github.com/GoogleCloudPlatform/generative-ai/search/gemini-enterprise/group-licensing/internal/models/dto"
+	"github.com/GoogleCloudPlatform/generative-ai/search/gemini-enterprise/group-licensing/internal/ports"
 )
 
 // JoinerService implements the "joiner" workflow: for every configured project
@@ -68,8 +68,12 @@ func (s *JoinerService) Run(ctx context.Context, cfg *config.EntitlementConfig, 
 	if req.DryRun != nil {
 		dryRun = *req.DryRun
 	}
+	directLaw := false
+	if req.DirectLaw != nil {
+		directLaw = *req.DirectLaw
+	}
 
-	licenseIndex, err := s.gemini.FetchLicenseConfigIndex(ctx, cfg.BillingAccountID)
+	licenseIndex, err := s.gemini.FetchLicenseConfigIndex(ctx, cfg.BillingAccountID, directLaw)
 	if err != nil {
 		return dto.SyncAddResponse{}, fmt.Errorf("fetching license config index: %w", err)
 	}
@@ -90,12 +94,13 @@ func (s *JoinerService) Run(ctx context.Context, cfg *config.EntitlementConfig, 
 	logger.InfoContext(ctx, "joiner workflow starting",
 		slog.Int("project_count", len(cfg.Projects)),
 		slog.Bool("dry_run", dryRun),
+		slog.Bool("direct_law_mode", directLaw),
 	)
 
 	var totalGranted, totalSoftFailed, totalGroups int
 
 	for projectID, projectCfg := range cfg.Projects {
-		granted, softFailed, groups, err := s.processProject(ctx, projectID, projectNumbers[projectID], projectCfg, licenseIndex, dryRun)
+		granted, softFailed, groups, err := s.processProject(ctx, projectID, projectNumbers[projectID], projectCfg, licenseIndex, dryRun, directLaw)
 		if err != nil {
 			logger.ErrorContext(ctx, "joiner workflow failed",
 				slog.String("project_id", projectID),
@@ -108,6 +113,15 @@ func (s *JoinerService) Run(ctx context.Context, cfg *config.EntitlementConfig, 
 		totalGranted += granted
 		totalSoftFailed += softFailed
 		totalGroups += groups
+		// verbose debug logging: Emitted per-project
+		logger.DebugContext(ctx, "project processed",
+			slog.String("project_id", projectID),
+			slog.Int("licenses_granted", granted),
+			slog.Int("licenses_soft_failed", softFailed),
+			slog.Int("groups_processed", groups),
+			slog.Bool("dry_run", dryRun),
+			slog.Bool("direct_law_mode", directLaw),
+		)
 	}
 
 	elapsed := time.Since(start).Milliseconds()
@@ -117,6 +131,7 @@ func (s *JoinerService) Run(ctx context.Context, cfg *config.EntitlementConfig, 
 		slog.Int("licenses_soft_failed", totalSoftFailed),
 		slog.Int("groups_processed", totalGroups),
 		slog.Bool("dry_run", dryRun),
+		slog.Bool("direct_law_mode", directLaw),
 	)
 
 	return dto.SyncAddResponse{
@@ -124,72 +139,128 @@ func (s *JoinerService) Run(ctx context.Context, cfg *config.EntitlementConfig, 
 		LicensesSoftFailed: totalSoftFailed,
 		GroupsProcessed:    totalGroups,
 		DryRun:             dryRun,
+		DirectLaw:          directLaw,
 	}, nil
 }
 
 // userEntitlement pairs the highest-precedence SKU a user is entitled to with
-// the location of the group entry that granted it.
+// the location of the group entry that granted it. Alternatively, if admin-specified,
+// it pairs the SubscriptionID a user is entitled to with the location of the group entry.
 type userEntitlement struct {
-	SKU      models.SKU
-	Location models.Location
+	SKU            models.SKU
+	Location       models.Location
+	SubscriptionID string // only used in direct_law join mode, admin-specifies the {uuid} in licenseConfigs/{uuid}
 }
 
 // processProject enumerates all configured groups for a single GCP project,
 // resolves the highest-precedence (SKU, location) per user, looks up the
-// licenseConfig resource path from index, and issues the grant batches.
-// Updates are grouped by licenseConfigPath so each batch is homogeneous,
-// which allows per-SKU exhaustion handling without ambiguity.
+// licenseConfig entries from index, and issues the grant batches. Updates are
+// grouped by LicenseConfigKey (SKU + location) and then processed
+// sequentially across the slice of entries for that key, spilling soft-failed
+// users from an exhausted pool into the next pool's batch.
 // It returns the number of licenses granted, the number of users soft-failed
 // due to license pool exhaustion, and the number of groups processed.
-func (s *JoinerService) processProject(ctx context.Context, projectID, projectNumber string, projectCfg config.ProjectConfig, index models.LicenseConfigIndex, dryRun bool) (licensesGranted, licensesSoftFailed, groupsProcessed int, err error) {
+func (s *JoinerService) processProject(ctx context.Context, projectID, projectNumber string, projectCfg config.ProjectConfig, index models.LicenseConfigIndex, dryRun bool, directLaw bool) (licensesGranted, licensesSoftFailed, groupsProcessed int, err error) {
 	// userBestEntitlement maps each user email to the highest-ranked entitlement
 	// (SKU + location) across all groups in this project.
 	userBestEntitlement := make(map[string]userEntitlement)
 
 	for _, cfgEntry := range projectCfg {
 		for _, groupEmail := range cfgEntry.Groups {
-			if err := s.collectGroupMembers(ctx, groupEmail, cfgEntry.SubscriptionTier, cfgEntry.Location, userBestEntitlement); err != nil {
+			subID := ""
+			if directLaw {
+				subID = *cfgEntry.SubscriptionID
+			}
+			if err := s.collectGroupMembers(ctx, groupEmail, cfgEntry.SubscriptionTier, subID, cfgEntry.Location, userBestEntitlement, directLaw); err != nil {
 				return 0, 0, 0, fmt.Errorf("project %q group %q: %w", projectID, groupEmail, err)
 			}
 			groupsProcessed++
 		}
 	}
 
-	// Group updates by licenseConfigPath so each batch is homogeneous.
-	// This allows exhaustion handling to target the correct SKU pool.
-	pendingByConfig := make(map[string][]models.LicenseUpdate)
-	entryByConfigPath := make(map[string]models.LicenseConfigEntry)
+	// Group updates by LicenseConfigKey so the multi-pool spill logic below
+	// can iterate the ordered slice of entries for each key.
+	pendingByKey := make(map[models.LicenseConfigKey][]models.LicenseUpdate)
 
 	for email, ent := range userBestEntitlement {
-		key := models.LicenseConfigKey{SKU: ent.SKU, ProjectNumber: projectNumber, Location: ent.Location}
-		idxEntry, ok := index[key]
-		if !ok {
+		// Default behavior is to index by SKU (automatic mode)
+		key := models.LicenseConfigKey{
+			SKU:           ent.SKU,
+			ProjectNumber: projectNumber,
+			Location:      ent.Location,
+		}
+		// If in direct_law mode, change to index by admin-specified SubscriptionID
+		if directLaw {
+			key = models.LicenseConfigKey{
+				SubscriptionID: ent.SubscriptionID,
+				ProjectNumber:  projectNumber,
+				Location:       ent.Location,
+			}
+		}
+		entries, ok := index[key]
+		if !ok || len(entries) == 0 {
+			if directLaw {
+				return 0, 0, 0, fmt.Errorf("project %q: no licenseConfig found for SKU %q Subscription %q location %q", projectID, ent.SKU, ent.SubscriptionID, ent.Location)
+			}
 			return 0, 0, 0, fmt.Errorf("project %q: no licenseConfig found for SKU %q location %q", projectID, ent.SKU, ent.Location)
 		}
-		pendingByConfig[idxEntry.Path] = append(pendingByConfig[idxEntry.Path], models.LicenseUpdate{
-			UserEmail:         email,
-			SKU:               ent.SKU,
-			Location:          ent.Location,
-			LicenseConfigPath: idxEntry.Path,
-			Action:            models.LicenseActionGrant,
+		// If in direct_law mode, for each user include LicenseConfigPath in the key because {uuid} is unambiguous and should be unique; assume {uuid} unique and defined once in config.json and only create slice of just one LicenseUpdate entry
+		if directLaw {
+			for _, entry := range entries {
+				pendingUpdate := models.LicenseUpdate{
+					UserEmail:         email,
+					SKU:               ent.SKU,
+					Location:          ent.Location,
+					LicenseConfigPath: entry.Path,
+					Action:            models.LicenseActionGrant,
+				}
+				pendingByKey[key] = append(pendingByKey[key], pendingUpdate)
+			}
+
+		} else {
+			// Default behavior for each user is to index by SKU which holds a slice of one or many LicenseUpdates
+		// LicenseConfigPath will be resolved per-entry when building each chunk.
+		pendingByKey[key] = append(pendingByKey[key], models.LicenseUpdate{
+			UserEmail: email,
+			SKU:       ent.SKU,
+			Location:  ent.Location,
+			Action:    models.LicenseActionGrant,
 		})
-		entryByConfigPath[idxEntry.Path] = idxEntry
+		}
 	}
 
-	for configPath, updates := range pendingByConfig {
-		idxEntry := entryByConfigPath[configPath]
-		for _, chunk := range chunkLicenseUpdates(updates, models.MaxBatchSize) {
-			if dryRun {
-				licensesGranted += len(chunk)
-				continue
+	for key, updates := range pendingByKey {
+		entries := index[key]
+		remaining := updates
+		for _, entry := range entries {
+			if len(remaining) == 0 {
+				break
 			}
-			granted, softFailed, err := s.grantBatch(ctx, projectID, projectNumber, idxEntry, chunk)
-			if err != nil {
-				return 0, 0, 0, fmt.Errorf("project %q batch grant: %w", projectID, err)
+			// Stamp the resolved path onto every update before chunking so each
+			// batch carry the correct licenseConfigPath for this pool.
+			resolved := make([]models.LicenseUpdate, len(remaining))
+			for i, u := range remaining {
+				u.LicenseConfigPath = entry.Path
+				resolved[i] = u
 			}
-			licensesGranted += granted
-			licensesSoftFailed += softFailed
+			var totalGranted int
+			var nextRemaining []models.LicenseUpdate
+			for _, chunk := range chunkLicenseUpdates(resolved, models.MaxBatchSize) {
+				if dryRun {
+					totalGranted += len(chunk)
+					continue
+				}
+				granted, softFailed, err := s.grantBatch(ctx, projectID, projectNumber, entry, chunk)
+				if err != nil {
+					return 0, 0, 0, fmt.Errorf("project %q batch grant: %w", projectID, err)
+				}
+				totalGranted += granted
+				nextRemaining = append(nextRemaining, softFailed...)
+			}
+			licensesGranted += totalGranted
+			remaining = nextRemaining
 		}
+		licensesSoftFailed += len(remaining)
 	}
 
 	return licensesGranted, licensesSoftFailed, groupsProcessed, nil
@@ -198,21 +269,30 @@ func (s *JoinerService) processProject(ctx context.Context, projectID, projectNu
 // grantBatch issues a BatchUpdateUserLicenses call for a homogeneous batch
 // (all updates share the same licenseConfigPath). On license pool exhaustion
 // it fetches the current usage stats, retries with however many seats remain,
-// and soft-fails the rest. Non-exhaustion errors are returned as hard failures.
-// It returns the number of licenses granted and the number soft-failed.
-func (s *JoinerService) grantBatch(ctx context.Context, projectID, projectNumber string, entry models.LicenseConfigEntry, batch []models.LicenseUpdate) (granted, softFailed int, err error) {
+// and returns the remainder as soft-failed updates so the caller can forward
+// them to the next pool. Non-exhaustion errors are returned as hard failures.
+// It returns the number of licenses granted and the soft-failed update slice.
+func (s *JoinerService) grantBatch(ctx context.Context, projectID, projectNumber string, entry models.LicenseConfigEntry, batch []models.LicenseUpdate) (granted int, softFailedUpdates []models.LicenseUpdate, err error) {
 	logger := middleware.LoggerFromContext(ctx)
 
-	if batchErr := s.gemini.BatchUpdateUserLicenses(ctx, projectID, batch); batchErr == nil {
-		return len(batch), 0, nil
+	location := batch[0].Location
+
+	if batchErr := s.gemini.BatchUpdateUserLicenses(ctx, projectID, location, batch); batchErr == nil {
+		// verbose debug logging: Emitted per batch
+		logger.DebugContext(ctx, "batch granted",
+			slog.String("project_id", projectID),
+			slog.Int("count", len(batch)),
+			slog.String("license_config_path", entry.Path),
+		)
+		return len(batch), nil, nil
 	} else if !errors.Is(batchErr, models.ErrLicensesExhausted) {
-		return 0, 0, batchErr
+		return 0, nil, batchErr
 	}
 
 	// License pool exhausted. Look up how many seats are still available.
-	usageStats, statsErr := s.gemini.FetchLicenseUsageStats(ctx, projectNumber)
+	usageStats, statsErr := s.gemini.FetchLicenseUsageStats(ctx, projectNumber, location)
 	if statsErr != nil {
-		return 0, 0, fmt.Errorf("fetching license usage stats after exhaustion: %w", statsErr)
+		return 0, nil, fmt.Errorf("fetching license usage stats after exhaustion: %w", statsErr)
 	}
 
 	used := usageStats[entry.Path]
@@ -229,21 +309,29 @@ func (s *JoinerService) grantBatch(ctx context.Context, projectID, projectNumber
 	)
 
 	if available == 0 {
-		return 0, len(batch), nil
+		return 0, batch, nil
 	}
 
 	// Retry with only the available seats. Any error here is a hard failure.
 	trimmed := batch[:available]
-	if retryErr := s.gemini.BatchUpdateUserLicenses(ctx, projectID, trimmed); retryErr != nil {
-		return 0, 0, retryErr
+	if retryErr := s.gemini.BatchUpdateUserLicenses(ctx, projectID, location, trimmed); retryErr != nil {
+		return 0, nil, retryErr
 	}
-	return int(available), len(batch) - int(available), nil
+
+	// verbose debug logging: Emitted per batch
+	logger.DebugContext(ctx, "batch granted after pool exhaustion",
+		slog.String("project_id", projectID),
+		slog.Int("count", int(available)),
+		slog.String("license_config_path", entry.Path),
+	)
+	
+	return int(available), batch[available:], nil
 }
 
 // collectGroupMembers pages through all members of groupEmail and updates
 // userBestEntitlement with the supplied (sku, location) when sku is higher
 // than any previously recorded SKU for that user.
-func (s *JoinerService) collectGroupMembers(ctx context.Context, groupEmail string, sku models.SKU, location models.Location, userBestEntitlement map[string]userEntitlement) error {
+func (s *JoinerService) collectGroupMembers(ctx context.Context, groupEmail string, sku models.SKU, subID string, location models.Location, userBestEntitlement map[string]userEntitlement, directLaw bool) error {
 	var pageToken string
 	var pageCount int
 
@@ -269,7 +357,10 @@ func (s *JoinerService) collectGroupMembers(ctx context.Context, groupEmail stri
 			if m.Type != models.MemberTypeUser {
 				continue
 			}
-
+			if directLaw {
+				userBestEntitlement[m.Email] = userEntitlement{SKU: sku, SubscriptionID: subID, Location: location}
+				continue
+			}
 			existing, seen := userBestEntitlement[m.Email]
 			if !seen || sku.HasHigherPrecedenceThan(existing.SKU) {
 				userBestEntitlement[m.Email] = userEntitlement{SKU: sku, Location: location}

@@ -24,8 +24,8 @@ import (
 	admin "google.golang.org/api/admin/directory/v1"
 	"google.golang.org/api/googleapi"
 
-	"github.com/cloud-gtm/gemini-box-office/internal/models"
-	"github.com/cloud-gtm/gemini-box-office/internal/ports"
+	"github.com/GoogleCloudPlatform/generative-ai/search/gemini-enterprise/group-licensing/internal/models"
+	"github.com/GoogleCloudPlatform/generative-ai/search/gemini-enterprise/group-licensing/internal/ports"
 )
 
 var _ ports.IdpClient = (*Adapter)(nil)
@@ -164,6 +164,8 @@ func mapHTTPError(err error) error {
 	}
 
 	switch {
+	case apiErr.Code == 400:
+		return fmt.Errorf("%w: %w", models.ErrInvalidMemberKey, apiErr)
 	case apiErr.Code == 429:
 		return fmt.Errorf("%w: %w", models.ErrAPIRateLimited, apiErr)
 	case apiErr.Code == 404:

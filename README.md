@@ -1,5 +1,7 @@
 # Generative AI on Google Cloud
 
+> The latest Gemini models are available! Try out [Gemini 3.7 Flash](https://github.com/GoogleCloudPlatform/generative-ai/blob/main/gemini/getting-started/intro_gemini_3_7_flash.ipynb).
+>
 > **[Gemini Enterprise Agent Platform](https://docs.cloud.google.com/gemini-enterprise-agent-platform)**, the latest evolution of Vertex AI, has been released!
 >
 > Check out the [`Google-Cloud-AI/agent-platform`](https://goo.gle/agent-platform-github) repository for a curated list of assets for agent building on Google Cloud.
@@ -89,6 +91,7 @@ This repository contains notebooks, code samples, sample apps, and other resourc
   - A collection of production-ready Generative AI Agent templates built for Google Cloud.
   - It accelerates development by providing a holistic, production-ready solution, addressing common challenges (Deployment & Operations, Evaluation, Customization, Observability) in building and deploying Gen AI agents.
 - [Gemini Cookbook](https://github.com/google-gemini/cookbook/)
+- [genai-factory](https://github.com/googleCloudPlatform/genai-factory) - A collection of end-to-end infrastructure blueprints to deploy generative AI infrastructures in GCP, using IaC and following security best-practices.
 - [Google Cloud Applied AI Engineering](https://github.com/GoogleCloudPlatform/applied-ai-engineering-samples)
 - [Vertex AI GenMedia Creative Studio](https://github.com/GoogleCloudPlatform/vertex-ai-creative-studio) - Experience Google's generative media foundational models + custom workflows.
 - [MCP Servers for GenMedia](https://goo.gle/vertex-genmedia-mcp) - Empower your agents with generative media tools.

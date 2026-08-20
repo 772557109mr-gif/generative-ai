@@ -33,6 +33,7 @@
 /generative-ai/gemini/sample-apps/finance-advisor-spanner/                                                                       @GoogleCloudPlatform/generative-ai-devrel @anirbanbagchi1979
 /generative-ai/gemini/sample-apps/genai-mlops-tune-and-eval                                                                      @GoogleCloudPlatform/generative-ai-devrel @willisc7
 /generative-ai/gemini/sample-apps/genwealth/                                                                                     @GoogleCloudPlatform/generative-ai-devrel @paulramsey
+/generative-ai/gemini/sample-apps/rosetta-agent-porter                                                            @GoogleCloudPlatform/generative-ai-devrel @lavinigam-gcp
 /generative-ai/gemini/sample-apps/photo-discovery                                                                                @GoogleCloudPlatform/generative-ai-devrel @KhanhNwin @kazunori279
 /generative-ai/gemini/tuning/gemini_supervised_finetuning_text_classification.ipynb                                              @GoogleCloudPlatform/generative-ai-devrel @eliasecchig @gabrielahrlr
 /generative-ai/gemini/tuning/supervised_finetuning_using_gemini.ipynb                                                            @GoogleCloudPlatform/generative-ai-devrel @dmoonat
@@ -59,6 +60,7 @@
 /generative-ai/open-models/use-cases/cloud_run_ollama_gemma2_rag_qa.ipynb                                                        @GoogleCloudPlatform/generative-ai-devrel @eliasecchig
 /generative-ai/search                                                                                                            @GoogleCloudPlatform/generative-ai-devrel @holtskinner
 /generative-ai/search/gemini-enterprise/group-licensing                                                                          @GoogleCloudPlatform/generative-ai-devrel @williamsmt @googlecharles
+/generative-ai/search/gemini-enterprise/ge-demo-generator/                                                                          @GoogleCloudPlatform/generative-ai-devrel @ryotat7
 /generative-ai/search/retrieval-augmented-generation/examples/contract_analysis.ipynb                                            @GoogleCloudPlatform/generative-ai-devrel @guruvittal
 /generative-ai/speech/getting-started                                                                                            @GoogleCloudPlatform/generative-ai-devrel @inardini
 /generative-ai/speech/use-cases/storytelling                                                                                     @GoogleCloudPlatform/generative-ai-devrel @holtskinner
@@ -74,5 +76,8 @@
 /generative-ai/gemini/evaluation/evaluate_gemini_structured_output.ipynb                                                         @GoogleCloudPlatform/generative-ai-devrel @stevie-p
 /generative-ai/agents/gke/agents_with_memory/get_started_with_memory_for_adk_in_gke.ipynb                                        @GoogleCloudPlatform/generative-ai-devrel @vladkol
 /generative-ai/agents/cloud_run/agents_with_memory/get_started_with_memory_for_adk_in_cloud_run.ipynb                            @GoogleCloudPlatform/generative-ai-devrel @vladkol
+/generative-ai/agents/agent_engine/tutorial_bidi_stream_v2.ipynb                                                                 @GoogleCloudPlatform/generative-ai-devrel @ericgribkoff
 /generative-ai/gemini/sample-apps/gemini-live-telephony-app                                                                      @GoogleCloudPlatform/generative-ai-devrel @KVishnuVardhanR
 /generative-ai/search/auto-rag-eval                                                                                              @tanyagoogle
+/generative-ai/agents/personalized-agent-swarms                                                                  @GoogleCloudPlatform/generative-ai-devrel @tanyagoogle @PouyaOmran @soujanyav @olifei
+/generative-ai/gemini/sample-apps/prism-science-explainer                                                                        @GoogleCloudPlatform/generative-ai-devrel @lavinigam-gcp

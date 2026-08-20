@@ -54,7 +54,7 @@ type LicenseUpdate struct {
 	UserEmail         string
 	SKU               SKU
 	Location          Location
-	LicenseConfigPath string // revokes only: resource path from UserLicense
+	LicenseConfigPath string // revokes and direct_law join only: resource path from UserLicense
 	Action            LicenseAction
 }
 
@@ -64,9 +64,10 @@ type LicenseUpdate struct {
 // the human-readable project ID — the Discovery Engine API uses numbers in
 // licenseConfig resource paths.
 type LicenseConfigKey struct {
-	SKU           SKU
-	ProjectNumber string
-	Location      Location
+	SKU            SKU
+	SubscriptionID string // only used in direct_law join mode, admin-specifies the {uuid} in licenseConfigs/{uuid}
+	ProjectNumber  string
+	Location       Location
 }
 
 // LicenseConfigEntry holds the full licenseConfig resource path and the number
@@ -79,7 +80,8 @@ type LicenseConfigEntry struct {
 }
 
 // LicenseConfigIndex maps (SKU, ProjectNumber, Location) to the resolved
-// LicenseConfigEntry. It is built once at startup from the
-// billingAccountLicenseConfigs API and used by the service layer to resolve
-// grant operations and look up available seat capacity.
-type LicenseConfigIndex map[LicenseConfigKey]LicenseConfigEntry
+// LicenseConfigEntry slice. Multiple active subscriptions with the same
+// SKU+project+location each contribute a distinct entry; the slice preserves
+// all of them so the service layer can spill users across pools when one is
+// exhausted.
+type LicenseConfigIndex map[LicenseConfigKey][]LicenseConfigEntry

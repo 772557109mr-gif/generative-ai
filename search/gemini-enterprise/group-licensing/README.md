@@ -1,4 +1,4 @@
-# Gemini Box Office
+# Gemini Enterprise Group Licensing
 
 A Cloud Run Job that automates Gemini Enterprise license lifecycle management through scheduled batch reconciliation. It bridges the gap between Google Cloud Identity group membership and Discovery Engine license assignment, providing group-based SKU mapping, automatic provisioning, and stale-license cleanup.
 
@@ -19,6 +19,7 @@ Two Cloud Run Job definitions are deployed from a single container image, each t
 |---|---|---|
 | `JOB_TYPE` | Selects the workflow to run (`joiner` or `garbage_collection`). Required. | — |
 | `DRY_RUN` | When `true`, the full evaluation runs but no write API calls are made. Can be overridden per execution via the Cloud Scheduler request body. | `false` |
+| `GC_SKIP_GROUP_EVAL` | When `true`, the Garbage Collection job will skip group membership evaluation for currently licensed users. Users will be revoked solely based on license staleness. Only applicable to the garbage collection job. | `false` |
 | `CLOUD_RUN_TASK_INDEX` | Injected by Cloud Run. 0-based index of this task instance. | `0` |
 | `CLOUD_RUN_TASK_COUNT` | Injected by Cloud Run. Total number of concurrent task instances. | `1` |
 
@@ -95,6 +96,10 @@ The job's service account requires the following:
 - `roles/cloudidentity.groups.viewer` — list group members and verify membership
 - `roles/secretmanager.secretAccessor` — read the mounted configuration secret
 - `roles/billing.viewer` — read the purchased Gemini Enterprise subscription configurations
+- `roles/run.builder` - (Optional) When using Cloud Build to build the artifacts
+- `roles/storage.admin` - (Optional) When using Cloud Build, to upload source code and stage the build
+- `roles/artifactregistry.createOnPushWriter` - (Optional) When using Cloud Build, to push the built artifact to Artifact Registry
+- `roles/logging.logWriter` - (Optional) When using Cloud Build, to write build logs
 
 **OAuth scopes:**
 - `https://www.googleapis.com/auth/cloud-platform`
@@ -104,6 +109,11 @@ The job's service account requires the following:
 - Discovery Engine API (GCP)
 - Resource Manager API (GCP)
 - Admin SDK API (Cloud Identity / Workspace)
+- Cloud Run Admin API (Optional)
+- Cloud Build API (Optional)
+- Compute Engine API (Optional)
+- Secret Manager API (Optional)
+- Cloud Scheduler API (Optional)
 
 The job uses **Application Default Credentials**. No service account key files are required.
 
@@ -144,13 +154,36 @@ All tests are unit tests and require no external services or credentials.
 
 ## Deploying to Cloud Run as Job
 
-An example command to deploy as a job on Cloud Run is below. For more information on creating Cloud Run jobs, reference documentation [here](https://docs.cloud.google.com/run/docs/create-jobs).
+An example single-command to build and deploy as a job on Cloud Run is below. For more information on creating Cloud Run jobs, reference documentation [here](https://docs.cloud.google.com/run/docs/create-jobs).
 ```bash
 gcloud run jobs deploy [name_of_job] \
   --source . \
   --region [desired_cloud_run_region] \
   --update-secrets=/run/secrets/entitlements.json=[name_of_secret_in_secret_manager]:latest \
-  --set-env-vars JOB_TYPE=[joiner_or_garbage_collection],DRY_RUN=false
+  --set-env-vars JOB_TYPE=[joiner_or_garbage_collection],DRY_RUN=false,GC_SKIP_GROUP_EVAL=false \
+  --service-account [desired_service_account_email_address]
+```
+
+## Building the container with Cloud Build, saving to Artifact Registry, and deploying as Cloud Run Job
+
+To build the container image and save it to Artifact Registry for deployment later, reference the following example build command. For more information on Cloud Build, reference documentation [here](https://docs.cloud.google.com/build/docs/overview).
+```bash
+gcloud builds submit . \
+  --tag [desired_gcp_region]-docker.pkg.dev/[gcp_project_id]/[artifact_registry_repository]/[artifact_registry_package_name]:latest \
+  --service-account=projects/[gcp_project_id]/serviceAccounts/[desired_build_service_account_email_address] \
+  --default-buckets-behavior=regional-user-owned-bucket \
+  --region=[desired_gcp_region]
+```
+
+Once build is completed successfully, deploy as Cloud Run Job using the built image from Artifact Registry.
+
+```bash
+gcloud run jobs deploy [name_of_job] \
+  --image [desired_gcp_region]-docker.pkg.dev/[gcp_project_id]/[artifact_registry_repository]/[artifact_registry_package_name]:latest \
+  --region [desired_cloud_run_region] \
+  --update-secrets=/run/secrets/entitlements.json=[name_of_secret_in_secret_manager]:latest \
+  --set-env-vars JOB_TYPE=[joiner_or_garbage_collection],DRY_RUN=false,GC_SKIP_GROUP_EVAL=false \
+  --service-account [desired_service_account_email_address]
 ```
 
 ## Job output
@@ -161,11 +194,13 @@ On completion the job exits `0` (success) or `1` (failure). Results are emitted 
 {"time":"...","level":"INFO","workflow":"joiner","task_index":0,"msg":"joiner workflow complete","duration_ms":4821,"licenses_granted":42,"licenses_soft_failed":0,"groups_processed":5,"dry_run":false}
 ```
 
-If the license pool for a SKU is exhausted mid-run, a warning is emitted and the job continues:
+If the license pool for a SKU is exhausted mid-run, a warning is emitted per exhausted pool and the job continues:
 
 ```json
 {"time":"...","level":"WARN","workflow":"joiner","task_index":0,"msg":"license pool exhausted, soft-failing remaining users","project_id":"customer-project-alpha","license_config_path":"projects/123/locations/global/licenseConfigs/ent-config","available":3,"soft_failed":17}
 ```
+
+If the billing account has multiple active subscriptions for the same SKU, users who could not be seated in one pool are automatically carried forward to the next. A warning fires for each exhausted pool, but the `licenses_soft_failed` count in the final summary reflects only users who remained unseated after all pools for that SKU were tried.
 
 ```json
 {"time":"...","level":"INFO","workflow":"garbage_collection","task_index":0,"msg":"garbage collection workflow complete","duration_ms":9134,"licenses_revoked":12,"users_evaluated":500,"dry_run":false}
